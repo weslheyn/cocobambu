@@ -877,265 +877,242 @@ const S = {
 // a user gesture (onclick). All subsequent speaks work fine.
 // ═══════════════════════════════════════════════════════
 
-const vSynth = window.speechSynthesis || null;
-let vVoices    = [];
-let vSeqToken  = 0;
-let vSeqTimer  = null;
-let vKaTimer   = null;
-let vActive    = false;
-let vUnlocked  = false; // audio context unlocked by user gesture
 
-// Load voices
+const vSynth = window.speechSynthesis || null;
+let vVoices = [];
+let vSeqToken = 0;
+let vSeqTimer = null;
+
+// Carrega vozes
 (function(){
   if(!vSynth) return;
   const load = ()=>{ vVoices = vSynth.getVoices(); };
   load();
   if(vSynth.onvoiceschanged !== undefined) vSynth.onvoiceschanged = load;
+  setTimeout(load, 200); setTimeout(load, 800); setTimeout(load, 2000);
 })();
 
 function getBestVoice(){
-  if(!vVoices.length) vVoices = vSynth ? vSynth.getVoices() : [];
-  return vVoices.find(v=>/pt-BR/i.test(v.lang))
-      || vVoices.find(v=>/pt/i.test(v.lang))
-      || vVoices[0] || null;
+  return vVoices.find(v=>v.lang==='pt-BR')
+      || vVoices.find(v=>v.lang.startsWith('pt'))
+      || (vVoices.length ? vVoices[0] : null);
 }
 
 function vCancelSeq(){
   vSeqToken++;
   if(vSeqTimer){ clearTimeout(vSeqTimer); vSeqTimer=null; }
-  if(vKaTimer){  clearInterval(vKaTimer);  vKaTimer=null;  }
-  try{ if(vSynth) vSynth.cancel(); }catch(e){}
+  if(vSynth) try{ vSynth.cancel(); }catch(e){}
 }
 
-// Make a configured utterance
-function _makeU(text){
+// Fala um texto e chama onDone quando terminar (ou falhar)
+function vSpeak(text, token, onDone){
+  if(!vSynth || token !== vSeqToken){ if(onDone) onDone(); return; }
+  
+  vSynth.cancel();
+  
+  // Mostra texto na tela
+  const el = document.getElementById('npWord');
+  if(el){ el.textContent = text; el.style.display = 'block'; }
+
   const u = new SpeechSynthesisUtterance(text);
   u.lang   = 'pt-BR';
-  u.rate   = parseFloat(S.vSpd) || 1.0;
-  u.pitch  = 1.0;
-  u.volume = 1.0;
+  u.rate   = S.vSpd;
+  u.pitch  = 1;
+  u.volume = 1;
   const v = getBestVoice();
   if(v) u.voice = v;
-  return u;
-}
 
-// Core speak function
-// IMPORTANT: do NOT call vSynth.cancel() inside here — 
-// only cancel before starting a new item (in vCancelSeq)
-function vSpeak(text, token, onDone){
-  if(!vSynth){ if(onDone) onDone(); return; }
-  if(token !== vSeqToken){ if(onDone) onDone(); return; }
-
-  const el = document.getElementById('npWord');
-  if(el){ el.textContent = text; el.style.display='block'; }
-
-  const u = _makeU(text);
-  let done = false;
-  
-  // Safety fallback: if onend never fires (Android bug), 
-  // use estimated duration + large buffer
-  const rate = parseFloat(S.vSpd) || 1.0;
-  const estMs = Math.max(3000, (text.length / 10) * 1000 / rate) + 5000;
-  const fallback = setTimeout(()=>{ if(!done) finish(); }, estMs);
-
-  const finish = ()=>{
-    if(done) return;
-    done = true;
-    clearTimeout(fallback);
-    if(vKaTimer){ clearInterval(vKaTimer); vKaTimer=null; }
+  let called = false;
+  const done = ()=>{
+    if(called) return; called = true;
     if(token !== vSeqToken) return;
     if(onDone) onDone();
   };
-
-  u.onend   = finish;
+  u.onend   = done;
   u.onerror = (e)=>{
-    // 'interrupted' and 'canceled' are normal when we stop
     if(e.error === 'interrupted' || e.error === 'canceled') return;
-    finish();
+    done(); // erro → avança mesmo assim
   };
 
-  // Keepalive: Chrome Android sometimes pauses TTS for no reason
-  if(vKaTimer){ clearInterval(vKaTimer); vKaTimer=null; }
-  vKaTimer = setInterval(()=>{
-    if(!vActive || token !== vSeqToken){ clearInterval(vKaTimer); vKaTimer=null; return; }
-    try{ if(vSynth.speaking && vSynth.paused) vSynth.resume(); }catch(e){}
-  }, 1000);
+  // Keep-alive: Chrome desktop pausa após ~15s
+  const ka = setInterval(()=>{
+    if(!S.vPlaying || token !== vSeqToken){ clearInterval(ka); return; }
+    if(vSynth.paused) vSynth.resume();
+  }, 8000);
 
-  try{
-    vSynth.speak(u);
-  }catch(e){
-    clearTimeout(fallback);
-    if(vKaTimer){ clearInterval(vKaTimer); vKaTimer=null; }
-    if(onDone) onDone();
-  }
+  vSynth.speak(u);
 }
 
-// Speak current item: name → pause → description → pause → advance
+// Lê item atual: nome depois descrição, depois avança
 function vSpeakCurrent(){
-  const list = MENU[S.vCat] || [];
-  const aList = (S.vMode==='sel' && S.vSel && S.vSel.length>0)
-    ? S.vSel.map(i=>list[i]).filter(Boolean) : list;
-  const item = (S.vMode==='sel' && aList.length>0)
-    ? aList[S.vSelIdx % aList.length] : list[S.vIdx];
-  if(!item){ vStop(); return; }
-
-  vUpdateDisplay(item);
-  vRenderList();
-
-  // Cancel any previous speak and get fresh token
-  if(vSeqTimer){ clearTimeout(vSeqTimer); vSeqTimer=null; }
-  if(vKaTimer){ clearInterval(vKaTimer); vKaTimer=null; }
-  try{ vSynth.cancel(); }catch(e){}
-
-  const token = ++vSeqToken;
-
-  // Small delay after cancel() lets Chrome settle
-  vSeqTimer = setTimeout(()=>{
-    if(!vActive || token !== vSeqToken) return;
-    vSpeak(item.n, token, ()=>{
-      if(!vActive || token !== vSeqToken) return;
-      vSeqTimer = setTimeout(()=>{
-        if(!vActive || token !== vSeqToken) return;
-        vSpeak(item.d, token, ()=>{
-          if(!vActive || token !== vSeqToken) return;
-          vSeqTimer = setTimeout(()=>{
-            if(!vActive || token !== vSeqToken) return;
-            _vAdvance(list, aList);
-          }, 600);
-        });
-      }, 300);
-    });
-  }, 200);
-}
-
-function _vAdvance(list, activeList){
-  switch(S.vMode){
-    case 'repeat': vSpeakCurrent(); break;
-    case 'loop':
-      S.vIdx = (S.vIdx + 1) % list.length;
-      vSpeakCurrent();
-      break;
-    case 'rand':
-      S.vIdx = Math.floor(Math.random() * list.length);
-      vSpeakCurrent();
-      break;
-    case 'sel':
-      S.vSelIdx = ((S.vSelIdx||0) + 1) % (activeList.length||1);
-      vSpeakCurrent();
-      break;
-    default:
-      if(S.vIdx < list.length - 1){ S.vIdx++; vSpeakCurrent(); }
-      else{ vStop(); showToast('✅ Categoria concluída!'); }
-  }
-}
-
-// vToggle — MUST be called directly from onclick (user gesture)
-// This is what unlocks audio on Android/iOS
-function vToggle(){
-  if(vActive){ vStop(); return; }
-
   const items = MENU[S.vCat] || [];
   const item  = items[S.vIdx];
-  if(!item){ showToast('Selecione uma categoria'); return; }
+  if(!item){ vStop(); return; }
 
-  // Set state BEFORE any async work
-  vActive    = true;
+  vUpdateDisplay();
+  vRenderList();
+
+  const token = ++vSeqToken;
+  const nome  = item.n;
+  const desc  = item.d;
+
+  // Passo 1: lê o nome
+  vSpeak(nome, token, ()=>{
+    if(token !== vSeqToken || !S.vPlaying) return;
+    // Pequena pausa entre nome e descrição
+    vSeqTimer = setTimeout(()=>{
+      if(token !== vSeqToken || !S.vPlaying) return;
+      // Passo 2: lê a descrição
+      vSpeak(desc, token, ()=>{
+        if(token !== vSeqToken || !S.vPlaying) return;
+        // Avança para próximo item
+        vSeqTimer = setTimeout(()=>{
+          if(token !== vSeqToken || !S.vPlaying) return;
+          if(S.vRep){ vSpeakCurrent(); return; }
+          const list = MENU[S.vCat] || [];
+          if(S.vIdx < list.length - 1){
+            S.vIdx++;
+            vSpeakCurrent();
+          } else {
+            vStop();
+            showToast('✅ Categoria concluída!');
+          }
+        }, 800);
+      });
+    }, 400);
+  });
+}
+
+// vToggle DEVE chamar speak() diretamente no handler do toque
+// para que o Android conceda permissão de áudio
+function vToggle(){
+  if(S.vPlaying){ vStop(); return; }
+
   S.vPlaying = true;
   document.getElementById('playBtn').textContent = '⏸';
   document.getElementById('viz').classList.add('playing');
 
-  if(!vSynth){
-    showToast('Seu navegador não suporta síntese de voz');
-    vActive = false; S.vPlaying = false;
-    document.getElementById('playBtn').textContent = '▶';
-    document.getElementById('viz').classList.remove('playing');
-    return;
-  }
+  // Dispara speak() AQUI, dentro do evento de toque
+  // Isso é o que o Android exige para liberar o áudio
+  if(vSynth){
+    const items = MENU[S.vCat] || [];
+    const item  = items[S.vIdx];
+    if(item){
+      vUpdateDisplay(); vRenderList();
+      const token = ++vSeqToken;
+      const nome  = item.n;
+      const desc  = item.d;
+      const el = document.getElementById('npWord');
+      if(el){ el.textContent = nome; el.style.display = 'block'; }
 
-  // ANDROID UNLOCK: call speak() synchronously inside this user gesture
-  // Use a zero-length space utterance to unlock audio context,
-  // then chain into real content
-  try{ vSynth.cancel(); }catch(e){}
-
-  const token = ++vSeqToken;
-  vUpdateDisplay(item);
-  vRenderList();
-
-  const el = document.getElementById('npWord');
-  if(el){ el.textContent = item.n; el.style.display='block'; }
-
-  const u = _makeU(item.n);
-  let done = false;
-  const rate = parseFloat(S.vSpd) || 1.0;
-  const estMs = Math.max(3000, (item.n.length / 10) * 1000 / rate) + 5000;
-  const fallback = setTimeout(()=>{ if(!done) afterName(); }, estMs);
-
-  const afterName = ()=>{
-    if(done) return; done = true;
-    clearTimeout(fallback);
-    if(vKaTimer){ clearInterval(vKaTimer); vKaTimer=null; }
-    if(!vActive || token !== vSeqToken) return;
-    vSeqTimer = setTimeout(()=>{
-      if(!vActive || token !== vSeqToken) return;
-      vSpeak(item.d, token, ()=>{
-        if(!vActive || token !== vSeqToken) return;
+      const u = new SpeechSynthesisUtterance(nome);
+      u.lang = 'pt-BR'; u.rate = S.vSpd; u.pitch = 1; u.volume = 1;
+      const v = getBestVoice(); if(v) u.voice = v;
+      let called = false;
+      u.onend = u.onerror = (e)=>{
+        if(e && (e.error === 'interrupted' || e.error === 'canceled')) return;
+        if(called) return; called = true;
+        if(token !== vSeqToken || !S.vPlaying) return;
         vSeqTimer = setTimeout(()=>{
-          if(!vActive || token !== vSeqToken) return;
-          const list = MENU[S.vCat] || [];
-          const aList = (S.vMode==='sel' && S.vSel && S.vSel.length>0)
-            ? S.vSel.map(i=>list[i]).filter(Boolean) : list;
-          _vAdvance(list, aList);
-        }, 600);
-      });
-    }, 300);
-  };
-
-  u.onend   = afterName;
-  u.onerror = (e)=>{ if(e.error==='interrupted'||e.error==='canceled') return; afterName(); };
-
-  if(vKaTimer){ clearInterval(vKaTimer); vKaTimer=null; }
-  vKaTimer = setInterval(()=>{
-    if(!vActive || token !== vSeqToken){ clearInterval(vKaTimer); vKaTimer=null; return; }
-    try{ if(vSynth.speaking && vSynth.paused) vSynth.resume(); }catch(e){}
-  }, 1000);
-
-  try{ vSynth.speak(u); }catch(e){ clearTimeout(fallback); afterName(); }
+          if(token !== vSeqToken || !S.vPlaying) return;
+          vSpeak(desc, token, ()=>{
+            if(token !== vSeqToken || !S.vPlaying) return;
+            vSeqTimer = setTimeout(()=>{
+              if(token !== vSeqToken || !S.vPlaying) return;
+              if(S.vRep){ vSpeakCurrent(); return; }
+              const list = MENU[S.vCat] || [];
+              if(S.vIdx < list.length - 1){ S.vIdx++; vSpeakCurrent(); }
+              else { vStop(); showToast('✅ Categoria concluída!'); }
+            }, 800);
+          });
+        }, 400);
+      };
+      vSynth.speak(u);
+    }
+  } else {
+    vSpeakCurrent();
+  }
 }
 
 function vStop(){
-  vActive    = false;
   S.vPlaying = false;
   vCancelSeq();
   const el = document.getElementById('npWord');
-  if(el){ el.style.display='none'; }
-  const pb = document.getElementById('playBtn');
-  if(pb) pb.textContent = '▶';
-  const viz = document.getElementById('viz');
-  if(viz) viz.classList.remove('playing');
+  if(el){ el.textContent=''; el.style.display='none'; }
+  document.getElementById('playBtn').textContent = '▶';
+  document.getElementById('viz').classList.remove('playing');
 }
 
 function vNext(){
-  const l = MENU[S.vCat]||[];
-  if(S.vIdx < l.length-1) S.vIdx++;
-  if(!vActive){ const it=l[S.vIdx]; if(it) vUpdateDisplay(it); vRenderList(); return; }
   vCancelSeq();
-  vActive=true; S.vPlaying=true;
-  document.getElementById('playBtn').textContent='⏸';
-  document.getElementById('viz').classList.add('playing');
-  setTimeout(()=>{ if(vActive) vSpeakCurrent(); }, 100);
+  const l = MENU[S.vCat] || [];
+  if(S.vIdx < l.length - 1){ S.vIdx++; }
+  if(S.vPlaying) vSpeakCurrent();
+  else { vUpdateDisplay(); vRenderList(); }
 }
-
 function vPrev(){
-  const l = MENU[S.vCat]||[];
-  if(S.vIdx > 0) S.vIdx--;
-  if(!vActive){ const it=l[S.vIdx]; if(it) vUpdateDisplay(it); vRenderList(); return; }
   vCancelSeq();
-  vActive=true; S.vPlaying=true;
-  document.getElementById('playBtn').textContent='⏸';
-  document.getElementById('viz').classList.add('playing');
-  setTimeout(()=>{ if(vActive) vSpeakCurrent(); }, 100);
+  if(S.vIdx > 0){ S.vIdx--; }
+  if(S.vPlaying) vSpeakCurrent();
+  else { vUpdateDisplay(); vRenderList(); }
+}
+function vRepeat(){
+  S.vRep = !S.vRep;
+  document.getElementById('repBtn').style.opacity = S.vRep ? '1' : '.35';
+  showToast(S.vRep ? '🔁 Repetindo item' : 'Repetição desativada');
+}
+function setSp(v, b){
+  S.vSpd = v;
+  document.querySelectorAll('.spd').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on');
+  if(S.vPlaying){ vCancelSeq(); vSpeakCurrent(); }
+}
+function vPlayIdx(i){
+  vCancelSeq();
+  S.vIdx = i;
+  if(S.vPlaying) vSpeakCurrent();
+  else { vUpdateDisplay(); vRenderList(); }
 }
 
+function vUpdateDisplay(){
+  const items = MENU[S.vCat] || [];
+  const item  = items[S.vIdx];
+  if(!item){
+    document.getElementById('npTtl').textContent  = 'Selecione uma categoria';
+    document.getElementById('npDesc').textContent = '';
+    return;
+  }
+  document.getElementById('npTtl').textContent  = item.n;
+  document.getElementById('npDesc').textContent = item.d;
+  S.seen.add(item.c);
+  S.voiceN++;
+}
+
+function vRenderList(){
+  const items = MENU[S.vCat] || [];
+  document.getElementById('vList').innerHTML = items.map((it,i)=>`
+    <div class="vitem ${i===S.vIdx?'cur':''}" onclick="vPlayIdx(${i})">
+      <div class="vnum">${i===S.vIdx && S.vPlaying ? '♪' : (i+1)}</div>
+      <div class="vname">${it.n}</div>
+      <div class="vplay">${i===S.vIdx && S.vPlaying ? '🔊' : '▶'}</div>
+    </div>`).join('');
+}
+
+function initVoice(){
+  const cats = Object.keys(MENU);
+  document.getElementById('vCats').innerHTML = cats.map(c=>`
+    <button class="cchip ${c===S.vCat?'on':''}" onclick="vSetCat('${c}')">${c}</button>`).join('');
+  vUpdateDisplay();
+  vRenderList();
+}
+
+function vSetCat(cat){
+  if(S.vPlaying) vStop();
+  S.vCat = cat; S.vIdx = 0;
+  document.querySelectorAll('.cchip').forEach(b=>b.classList.toggle('on', b.textContent===cat));
+  vUpdateDisplay();
+  vRenderList();
+}
 function vSetMode(mode){
   S.vMode = mode;
   document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('on'));
@@ -1143,52 +1120,6 @@ function vSetMode(mode){
   const el=document.getElementById(ids[mode]); if(el) el.classList.add('on');
   const labels={normal:'▶ Normal',repeat:'🔁 Repetir item',loop:'🔁 Loop categoria',rand:'🎲 Aleatório',sel:'📌 Selecionados'};
   showToast(labels[mode]||mode);
-}
-
-function vRepeat(){
-  vSetMode(S.vMode==='repeat'?'normal':'repeat');
-}
-
-function setSp(v,b){
-  S.vSpd=parseFloat(v);
-  document.querySelectorAll('.spd').forEach(x=>x.classList.remove('on'));
-  if(b) b.classList.add('on');
-  if(vActive){ vCancelSeq(); vActive=true; S.vPlaying=true;
-    document.getElementById('playBtn').textContent='⏸';
-    document.getElementById('viz').classList.add('playing');
-    setTimeout(()=>{ if(vActive) vSpeakCurrent(); },100);
-  }
-}
-
-function vPlayIdx(i){
-  S.vIdx=i;
-  if(!vActive){ const it=(MENU[S.vCat]||[])[i]; if(it) vUpdateDisplay(it); vRenderList(); return; }
-  vCancelSeq(); vActive=true; S.vPlaying=true;
-  document.getElementById('playBtn').textContent='⏸';
-  document.getElementById('viz').classList.add('playing');
-  setTimeout(()=>{ if(vActive) vSpeakCurrent(); },100);
-}
-
-function vUpdateDisplay(item){
-  if(!item) item=(MENU[S.vCat]||[])[S.vIdx];
-  if(!item) return;
-  const ttl=document.getElementById('npTtl');
-  const dsc=document.getElementById('npDesc');
-  if(ttl) ttl.textContent=(item.e?item.e+' ':'')+item.n;
-  if(dsc) dsc.textContent=item.d||'';
-}
-
-function vRenderList(){
-  const el=document.getElementById('vList'); if(!el) return;
-  const list=MENU[S.vCat]||[];
-  el.innerHTML=list.map((it,i)=>{
-    const isSel=S.vSel&&S.vSel.includes(i);
-    return `<div class="vli ${i===S.vIdx?'active':''}" onclick="vPlayIdx(${i})">
-      <span class="vli-em">${it.e||'🍽'}</span>
-      <span class="vli-nm">${it.n}</span>
-      <button class="vli-sel ${isSel?'on':''}" onclick="event.stopPropagation();vToggleSel(${i})">📌</button>
-    </div>`;
-  }).join('');
 }
 
 function vToggleSel(i){
@@ -1201,31 +1132,6 @@ function vToggleSel(i){
   if(btn) btn.textContent='📌 Selecionados'+(n>0?` (${n})`:'');
   showToast(n>0?`📌 ${n} selecionado(s)`:'Seleção limpa');
 }
-
-function initVoice(){
-  const cats=['Todos',...Object.keys(MENU)];
-  const strip=document.getElementById('vCats');
-  if(strip){
-    strip.innerHTML=cats.map(cat=>
-      `<button class="vcat-btn ${cat===S.vCat?'on':''}" data-cat="${cat}" onclick="vSetCat('${cat}')">${cat}</button>`
-    ).join('');
-  }
-  if(!S.vCat||S.vCat==='Todos'){ const fc=Object.keys(MENU)[0]; if(fc) S.vCat=fc; }
-  vRenderList();
-  const item=(MENU[S.vCat]||[])[S.vIdx]; if(item) vUpdateDisplay(item);
-}
-
-function vSetCat(cat){
-  S.vCat=cat; S.vIdx=0; S.vSelIdx=0;
-  if(S.vSel) S.vSel=[];
-  document.querySelectorAll('.vcat-btn').forEach(b=>b.classList.toggle('on',b.dataset.cat===cat));
-  vRenderList();
-  const item=(MENU[cat]||[])[0]; if(item) vUpdateDisplay(item);
-  if(vActive){ vCancelSeq(); vActive=true; S.vPlaying=true;
-    setTimeout(()=>{ if(vActive) vSpeakCurrent(); },100);
-  }
-}
-
 
 
 function initFlash(){
